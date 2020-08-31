@@ -248,8 +248,10 @@ sunos_new_string_list(void)
 	if (list == NULL)
 		return (NULL);
 	list->string = calloc(DEFAULT_LISTSIZE, sizeof(char *));
-	if (list->string == NULL)
+	if (list->string == NULL) {
+		free(list);
 		return (NULL);
+	}
 	list->nargs = 0;
 	list->listsize = DEFAULT_LISTSIZE;
 
@@ -618,7 +620,7 @@ sunos_add_devices(di_devlink_t link, void *arg)
 
 			if (sunos_fill_in_dev_info(dn, dev) != LIBUSB_SUCCESS) {
 				libusb_unref_device(dev);
-				usbi_dbg("get infomation fail");
+				usbi_dbg("get information fail");
 				continue;
 			}
 			if (usbi_sanitize_device(dev) < 0) {

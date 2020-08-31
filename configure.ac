@@ -75,13 +75,13 @@ case $host in
 *-darwin*)
 	AC_MSG_RESULT([Darwin/Mac OS X])
 	backend=darwin
-	poll=posix
+	events=posix
 	threads=posix
 	;;
 *-haiku*)
 	AC_MSG_RESULT([Haiku])
 	backend=haiku
-	poll=posix
+	events=posix
 	threads=posix
 	;;
 *-linux* | *-uclinux*)
@@ -96,37 +96,37 @@ case $host in
 		;;
 	esac
 	backend=linux
-	poll=posix
+	events=posix
 	threads=posix
 	;;
 *-netbsd*)
 	AC_MSG_RESULT([NetBSD])
 	backend=netbsd
-	poll=posix
+	events=posix
 	threads=posix
 	;;
 *-openbsd*)
 	AC_MSG_RESULT([OpenBSD])
 	backend=openbsd
-	poll=posix
+	events=posix
 	threads=posix
 	;;
 *-solaris*)
 	AC_MSG_RESULT([SunOS])
 	backend=sunos
-	poll=posix
+	events=posix
 	threads=posix
 	;;
 *-cygwin*)
 	AC_MSG_RESULT([Windows (using Cygwin)])
 	backend=windows
-	poll=windows
+	events=windows
 	threads=posix
 	;;
 *-mingw* | *msys*)
 	AC_MSG_RESULT([Windows])
 	backend=windows
-	poll=windows
+	events=windows
 	threads=windows
 	test "x$enable_shared" = xyes && create_import_lib=yes
 	EXTRA_CFLAGS="-fno-omit-frame-pointer"
@@ -136,19 +136,19 @@ case $host in
 	AC_MSG_WARN([The host being compiled for is not supported.])
 	AC_MSG_WARN([The library may compile but will not function in any useful manner.])
 	backend="null"
-	poll=posix
+	events=posix
 	threads="posix"
 	;;
 esac
 
-if test "x$poll" = xposix; then
-	AC_DEFINE([POLL_POSIX], [1], [Define to 1 if using the POSIX poll() implementation.])
+if test "x$events" = xposix; then
+	AC_DEFINE([EVENTS_POSIX], [1], [Define to 1 if using the POSIX events abstraction.])
 	AC_CHECK_TYPES([nfds_t], [], [], [[#include <poll.h>]])
 	AC_CHECK_FUNCS([pipe2])
-elif test "x$poll" = xwindows; then
-	AC_DEFINE([POLL_WINDOWS], [1], [Define to 1 if using the Windows poll() implementation.])
+elif test "x$events" = xwindows; then
+	AC_DEFINE([EVENTS_WINDOWS], [1], [Define to 1 if using the Windows events abstraction.])
 else
-	AC_MSG_ERROR([Unknown poll implementation])
+	AC_MSG_ERROR([Unknown events abstraction])
 fi
 
 if test "x$threads" = xposix; then
@@ -223,6 +223,44 @@ if test "x$have_clock_gettime" = xyes; then
 	AC_CHECK_DECL([CLOCK_MONOTONIC], [], [AC_MSG_ERROR([C library headers missing definition for CLOCK_MONOTONIC])], [[#include <time.h>]])
 elif test "x$backend" != xdarwin && test "x$backend" != xwindows; then
 	AC_MSG_ERROR([clock_gettime() is required on this platform])
+fi
+
+dnl eventfd support
+if test "x$backend" = xlinux || test "x$backend" = xsunos; then
+	AC_ARG_ENABLE([eventfd],
+		[AS_HELP_STRING([--enable-eventfd], [use eventfd for signalling [default=auto]])],
+		[use_eventfd=$enableval],
+		[use_eventfd=auto])
+	if test "x$use_eventfd" != xno; then
+		AC_CHECK_HEADER([sys/eventfd.h], [eventfd_h=yes], [eventfd_h=])
+		if test "x$eventfd_h" = xyes; then
+			AC_CHECK_DECLS([EFD_NONBLOCK, EFD_CLOEXEC], [eventfd_h_ok=yes], [eventfd_h_ok=], [[#include <sys/eventfd.h>]])
+			if test "x$eventfd_h_ok" = xyes; then
+				AC_CHECK_FUNC([eventfd], [eventfd_ok=yes], [eventfd_ok=])
+				if test "x$eventfd_ok" = xyes; then
+					AC_DEFINE([HAVE_EVENTFD], [1], [Define to 1 if the system has eventfd functionality.])
+				elif test "x$use_eventfd" = xyes; then
+					AC_MSG_ERROR([eventfd() function not found; glibc 2.9+ required])
+				fi
+			elif test "x$use_eventfd" = xyes; then
+				AC_MSG_ERROR([eventfd header not usable; glibc 2.9+ required])
+			fi
+		elif test "x$use_eventfd" = xyes; then
+			AC_MSG_ERROR([eventfd header not available; glibc 2.9+ required])
+		fi
+	fi
+	AC_MSG_CHECKING([whether to use eventfd for signalling])
+	if test "x$use_eventfd" = xno; then
+		AC_MSG_RESULT([no (disabled by user)])
+	elif test "x$eventfd_h" != xyes; then
+		AC_MSG_RESULT([no (header not available)])
+	elif test "x$eventfd_h_ok" != xyes; then
+		AC_MSG_RESULT([no (header not usable)])
+	elif test "x$eventfd_ok" != xyes; then
+		AC_MSG_RESULT([no (functions not available)])
+	else
+		AC_MSG_RESULT([yes])
+	fi
 fi
 
 dnl timerfd support
@@ -314,6 +352,8 @@ AC_ARG_ENABLE([tests-build],
 AM_CONDITIONAL([BUILD_EXAMPLES], [test "x$build_examples" != xno])
 AM_CONDITIONAL([BUILD_TESTS], [test "x$build_tests" != xno])
 AM_CONDITIONAL([CREATE_IMPORT_LIB], [test "x$create_import_lib" = xyes])
+AM_CONDITIONAL([EVENTS_POSIX], [test "x$events" = xposix])
+AM_CONDITIONAL([EVENTS_WINDOWS], [test "x$events" = xwindows])
 AM_CONDITIONAL([HAVE_SIGACTION], [test "x$have_sigaction" = xyes])
 AM_CONDITIONAL([OS_DARWIN], [test "x$backend" = xdarwin])
 AM_CONDITIONAL([OS_HAIKU], [test "x$backend" = xhaiku])
@@ -323,8 +363,6 @@ AM_CONDITIONAL([OS_NULL], [test "x$backend" = xnull])
 AM_CONDITIONAL([OS_OPENBSD], [test "x$backend" = xopenbsd])
 AM_CONDITIONAL([OS_SUNOS], [test "x$backend" = xsunos])
 AM_CONDITIONAL([OS_WINDOWS], [test "x$backend" = xwindows])
-AM_CONDITIONAL([POLL_POSIX], [test "x$poll" = xposix])
-AM_CONDITIONAL([POLL_WINDOWS], [test "x$poll" = xwindows])
 AM_CONDITIONAL([THREADS_POSIX], [test "x$threads" = xposix])
 AM_CONDITIONAL([THREADS_WINDOWS], [test "x$threads" = xwindows])
 AM_CONDITIONAL([USE_UDEV], [test "x$use_udev" = xyes])

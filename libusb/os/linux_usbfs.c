@@ -36,6 +36,7 @@
 #include <sys/mman.h>
 #include <sys/utsname.h>
 #include <sys/vfs.h>
+#include <unistd.h>
 
 /* sysfs vs usbfs:
  * opening a usbfs node causes the device to be resumed, so we attempt to
@@ -991,7 +992,7 @@ static int linux_get_parent_info(struct libusb_device *dev, const char *sysfs_di
 retry:
 	/* find the parent in the context */
 	usbi_mutex_lock(&ctx->usb_devs_lock);
-	list_for_each_entry(it, &ctx->usb_devs, list, struct libusb_device) {
+	for_each_device(ctx, it) {
 		struct linux_device_priv *priv = usbi_get_device_priv(it);
 
 		if (priv->sysfs_dir) {
@@ -1070,7 +1071,7 @@ void linux_hotplug_enumerate(uint8_t busnum, uint8_t devaddr, const char *sys_na
 	struct libusb_context *ctx;
 
 	usbi_mutex_static_lock(&active_contexts_lock);
-	list_for_each_entry(ctx, &active_contexts_list, list, struct libusb_context) {
+	for_each_context(ctx) {
 		linux_enumerate_device(ctx, busnum, devaddr, sys_name);
 	}
 	usbi_mutex_static_unlock(&active_contexts_lock);
@@ -1083,7 +1084,7 @@ void linux_device_disconnected(uint8_t busnum, uint8_t devaddr)
 	unsigned long session_id = busnum << 8 | devaddr;
 
 	usbi_mutex_static_lock(&active_contexts_lock);
-	list_for_each_entry(ctx, &active_contexts_list, list, struct libusb_context) {
+	for_each_context(ctx) {
 		dev = usbi_get_device_by_session_id(ctx, session_id);
 		if (dev) {
 			usbi_disconnect_device(dev);
@@ -1266,7 +1267,7 @@ static int initialize_handle(struct libusb_device_handle *handle, int fd)
 		hpriv->caps = USBFS_CAP_BULK_CONTINUATION;
 	}
 
-	return usbi_add_pollfd(HANDLE_CTX(handle), hpriv->fd, POLLOUT);
+	return usbi_add_event_source(HANDLE_CTX(handle), hpriv->fd, POLLOUT);
 }
 
 static int op_wrap_sys_device(struct libusb_context *ctx,
@@ -1352,7 +1353,7 @@ static void op_close(struct libusb_device_handle *dev_handle)
 
 	/* fd may have already been removed by POLLERR condition in op_handle_events() */
 	if (!hpriv->fd_removed)
-		usbi_remove_pollfd(HANDLE_CTX(dev_handle), hpriv->fd);
+		usbi_remove_event_source(HANDLE_CTX(dev_handle), hpriv->fd);
 	if (!hpriv->fd_keep)
 		close(hpriv->fd);
 }
@@ -1845,7 +1846,7 @@ static int submit_bulk_transfer(struct usbi_transfer *itransfer)
 	 * a time, but there is a big performance gain doing it this way.
 	 *
 	 * Newer versions lift the 16k limit (USBFS_CAP_NO_PACKET_SIZE_LIM),
-	 * using arbritary large transfers can still be a bad idea though, as
+	 * using arbitrary large transfers can still be a bad idea though, as
 	 * the kernel needs to allocate physical contiguous memory for this,
 	 * which may fail for large buffers.
 	 *
@@ -2614,13 +2615,14 @@ static int reap_for_handle(struct libusb_device_handle *handle)
 }
 
 static int op_handle_events(struct libusb_context *ctx,
-	struct pollfd *fds, usbi_nfds_t nfds, int num_ready)
+	void *event_data, unsigned int count, unsigned int num_ready)
 {
-	usbi_nfds_t n;
+	struct pollfd *fds = event_data;
+	unsigned int n;
 	int r;
 
 	usbi_mutex_lock(&ctx->open_devs_lock);
-	for (n = 0; n < nfds && num_ready > 0; n++) {
+	for (n = 0; n < count && num_ready > 0; n++) {
 		struct pollfd *pollfd = &fds[n];
 		struct libusb_device_handle *handle;
 		struct linux_device_handle_priv *hpriv = NULL;
@@ -2629,7 +2631,7 @@ static int op_handle_events(struct libusb_context *ctx,
 			continue;
 
 		num_ready--;
-		list_for_each_entry(handle, &ctx->open_devs, list, struct libusb_device_handle) {
+		for_each_open_device(ctx, handle) {
 			hpriv = usbi_get_device_handle_priv(handle);
 			if (hpriv->fd == pollfd->fd)
 				break;
@@ -2645,7 +2647,7 @@ static int op_handle_events(struct libusb_context *ctx,
 			/* remove the fd from the pollfd set so that it doesn't continuously
 			 * trigger an event, and flag that it has been removed so op_close()
 			 * doesn't try to remove it a second time */
-			usbi_remove_pollfd(HANDLE_CTX(handle), hpriv->fd);
+			usbi_remove_event_source(HANDLE_CTX(handle), hpriv->fd);
 			hpriv->fd_removed = 1;
 
 			/* device will still be marked as attached if hotplug monitor thread

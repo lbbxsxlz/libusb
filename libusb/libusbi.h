@@ -74,11 +74,11 @@
 #define PTR_ALIGN(v) \
 	(((v) + (sizeof(void *) - 1)) & ~(sizeof(void *) - 1))
 
-/* Internal abstraction for poll */
-#if defined(POLL_POSIX)
-#include "os/poll_posix.h"
-#elif defined(POLL_WINDOWS)
-#include "os/poll_windows.h"
+/* Internal abstraction for event handling */
+#if defined(EVENTS_POSIX)
+#include "os/events_posix.h"
+#elif defined(EVENTS_WINDOWS)
+#include "os/events_windows.h"
 #endif
 
 /* Internal abstraction for thread synchronization */
@@ -139,6 +139,9 @@ struct list_head {
 #define list_first_entry(ptr, type, member) \
 	list_entry((ptr)->next, type, member)
 
+#define list_next_entry(ptr, type, member) \
+	list_entry((ptr)->member.next, type, member)
+
 /* Get each entry from a list
  *  pos - A structure pointer has a "member" element
  *  head - list head
@@ -146,15 +149,24 @@ struct list_head {
  *  type - the type of the first parameter
  */
 #define list_for_each_entry(pos, head, member, type)			\
-	for (pos = list_entry((head)->next, type, member);		\
+	for (pos = list_first_entry(head, type, member);		\
 		 &pos->member != (head);				\
-		 pos = list_entry(pos->member.next, type, member))
+		 pos = list_next_entry(pos, type, member))
 
 #define list_for_each_entry_safe(pos, n, head, member, type)		\
-	for (pos = list_entry((head)->next, type, member),		\
-		 n = list_entry(pos->member.next, type, member);	\
+	for (pos = list_first_entry(head, type, member),		\
+		 n = list_next_entry(pos, type, member);		\
 		 &pos->member != (head);				\
-		 pos = n, n = list_entry(n->member.next, type, member))
+		 pos = n, n = list_next_entry(n, type, member))
+
+/* Helper macros to iterate over a list. The structure pointed
+ * to by "pos" must have a list_head member named "list".
+ */
+#define for_each_helper(pos, head, type) \
+	list_for_each_entry(pos, head, list, type)
+
+#define for_each_safe_helper(pos, n, head, type) \
+	list_for_each_entry_safe(pos, n, head, list, type)
 
 #define list_empty(entry) ((entry)->next == (entry))
 
@@ -293,8 +305,14 @@ struct libusb_context {
 	libusb_log_cb log_handler;
 #endif
 
-	/* internal event pipe, used for signalling occurrence of an internal event. */
-	int event_pipe[2];
+	/* used for signalling occurrence of an internal event. */
+	usbi_event_t event;
+
+#ifdef HAVE_OS_TIMER
+	/* used for timeout handling, if supported by OS.
+	 * this timer is maintained to trigger on the next pending timeout */
+	usbi_timer_t timer;
+#endif
 
 	struct list_head usb_devs;
 	usbi_mutex_t usb_devs_lock;
@@ -318,10 +336,12 @@ struct libusb_context {
 	 * take this lock first */
 	usbi_mutex_t flying_transfers_lock;
 
+#if !defined(_WIN32) && !defined(__CYGWIN__)
 	/* user callbacks for pollfd changes */
 	libusb_pollfd_added_cb fd_added_cb;
 	libusb_pollfd_removed_cb fd_removed_cb;
 	void *fd_cb_user_data;
+#endif
 
 	/* ensures that only one thread is handling events at any one time */
 	usbi_mutex_t events_lock;
@@ -349,14 +369,17 @@ struct libusb_context {
 	 * in order to safely close a device. Protected by event_data_lock. */
 	unsigned int device_close;
 
-	/* list and count of poll fds and an array of poll fd structures that is
-	 * (re)allocated as necessary prior to polling. Protected by event_data_lock. */
-	struct list_head ipollfds;
-        /* list of pollfds that have been removed. keeps track of pollfd changes
-         * between the poll call and */
-        struct list_head removed_ipollfds;
-	struct pollfd *pollfds;
-	usbi_nfds_t pollfds_cnt;
+	/* A list of currently active event sources. Protected by event_data_lock. */
+	struct list_head event_sources;
+
+	/* A list of event sources that have been removed since the last time
+	 * event sources were waited on. Protected by event_data_lock. */
+	struct list_head removed_event_sources;
+
+	/* A pointer and count to platform-specific data used for monitoring event
+	 * sources. Only accessed during event handling. */
+	void *event_data;
+	unsigned int event_data_cnt;
 
 	/* A list of pending hotplug messages. Protected by event_data_lock. */
 	struct list_head hotplug_msgs;
@@ -364,16 +387,13 @@ struct libusb_context {
 	/* A list of pending completed transfers. Protected by event_data_lock. */
 	struct list_head completed_transfers;
 
-#ifdef HAVE_TIMERFD
-	/* used for timeout handling, if supported by OS.
-	 * this timerfd is maintained to trigger on the next pending timeout */
-	int timerfd;
-#endif
-
 	struct list_head list;
 };
 
 extern struct libusb_context *usbi_default_context;
+
+extern struct list_head active_contexts_list;
+extern usbi_mutex_static_t active_contexts_lock;
 
 static inline struct libusb_context *usbi_get_context(struct libusb_context *ctx)
 {
@@ -381,14 +401,23 @@ static inline struct libusb_context *usbi_get_context(struct libusb_context *ctx
 }
 
 enum usbi_event_flags {
-	/* The list of pollfds has been modified */
-	USBI_EVENT_POLLFDS_MODIFIED = 1U << 0,
+	/* The list of event sources has been modified */
+	USBI_EVENT_EVENT_SOURCES_MODIFIED = 1U << 0,
 
 	/* The user has interrupted the event handler */
 	USBI_EVENT_USER_INTERRUPT = 1U << 1,
 
 	/* A hotplug callback deregistration is pending */
 	USBI_EVENT_HOTPLUG_CB_DEREGISTERED = 1U << 2,
+
+	/* One or more hotplug messages are pending */
+	USBI_EVENT_HOTPLUG_MSG_PENDING = 1U << 3,
+
+	/* One or more completed transfers are pending */
+	USBI_EVENT_TRANSFER_COMPLETED = 1U << 4,
+
+	/* A device is in the process of being closed */
+	USBI_EVENT_DEVICE_CLOSE = 1U << 5,
 };
 
 /* Macros for managing event handling state */
@@ -405,25 +434,6 @@ static inline void usbi_start_event_handling(struct libusb_context *ctx)
 static inline void usbi_end_event_handling(struct libusb_context *ctx)
 {
 	usbi_tls_key_set(ctx->event_handling_key, NULL);
-}
-
-/* Update the following function if new event sources are added */
-static inline int usbi_pending_events(struct libusb_context *ctx)
-{
-	return ctx->event_flags ||
-	       ctx->device_close ||
-	       !list_empty(&ctx->hotplug_msgs) ||
-	       !list_empty(&ctx->completed_transfers);
-}
-
-static inline int usbi_using_timerfd(struct libusb_context *ctx)
-{
-#ifdef HAVE_TIMERFD
-	return ctx->timerfd >= 0;
-#else
-	UNUSED(ctx);
-	return 0;
-#endif
 }
 
 struct libusb_device {
@@ -639,18 +649,60 @@ void usbi_signal_transfer_completion(struct usbi_transfer *itransfer);
 void usbi_connect_device(struct libusb_device *dev);
 void usbi_disconnect_device(struct libusb_device *dev);
 
-int usbi_signal_event(struct libusb_context *ctx);
-int usbi_clear_event(struct libusb_context *ctx);
-
-struct usbi_pollfd {
-	/* must come first */
-	struct libusb_pollfd pollfd;
-
+struct usbi_event_source {
+	struct usbi_event_source_data {
+		usbi_os_handle_t os_handle;
+		short poll_events;
+	} data;
 	struct list_head list;
 };
 
-int usbi_add_pollfd(struct libusb_context *ctx, int fd, short events);
-void usbi_remove_pollfd(struct libusb_context *ctx, int fd);
+int usbi_add_event_source(struct libusb_context *ctx, usbi_os_handle_t os_handle,
+	short poll_events);
+void usbi_remove_event_source(struct libusb_context *ctx, usbi_os_handle_t os_handle);
+
+/* OS event abstraction */
+
+int usbi_create_event(usbi_event_t *event);
+void usbi_destroy_event(usbi_event_t *event);
+void usbi_signal_event(usbi_event_t *event);
+void usbi_clear_event(usbi_event_t *event);
+
+#ifdef HAVE_OS_TIMER
+int usbi_create_timer(usbi_timer_t *timer);
+void usbi_destroy_timer(usbi_timer_t *timer);
+int usbi_arm_timer(usbi_timer_t *timer, const struct timespec *timeout);
+int usbi_disarm_timer(usbi_timer_t *timer);
+#endif
+
+static inline int usbi_using_timer(struct libusb_context *ctx)
+{
+#ifdef HAVE_OS_TIMER
+	return usbi_timer_valid(&ctx->timer);
+#else
+	UNUSED(ctx);
+	return 0;
+#endif
+}
+
+struct usbi_reported_events {
+	union {
+		struct {
+			unsigned int event_triggered:1;
+#ifdef HAVE_OS_TIMER
+			unsigned int timer_triggered:1;
+#endif
+		};
+		unsigned int event_bits;
+	};
+	void *event_data;
+	unsigned int event_data_count;
+	unsigned int num_ready;
+};
+
+int usbi_alloc_event_data(struct libusb_context *ctx);
+int usbi_wait_for_events(struct libusb_context *ctx,
+	struct usbi_reported_events *reported_events, int timeout_ms);
 
 /* accessor functions for structure private data */
 
@@ -807,7 +859,7 @@ struct usbi_os_backend {
 	 * and other operations so that those operations can happen (hopefully)
 	 * without hiccup. This is also a good place to inform libusb that it
 	 * should monitor certain file descriptors related to this device -
-	 * see the usbi_add_pollfd() function.
+	 * see the usbi_add_event_source() function.
 	 *
 	 * Your backend should also initialize the device structure
 	 * (dev_handle->dev), which is NULL at the beginning of the call.
@@ -836,7 +888,7 @@ struct usbi_os_backend {
 	 * and other operations so that those operations can happen (hopefully)
 	 * without hiccup. This is also a good place to inform libusb that it
 	 * should monitor certain file descriptors related to this device -
-	 * see the usbi_add_pollfd() function.
+	 * see the usbi_add_event_source() function.
 	 *
 	 * This function should not generate any bus I/O and should not block.
 	 *
@@ -857,9 +909,9 @@ struct usbi_os_backend {
 
 	/* Close a device such that the handle cannot be used again. Your backend
 	 * should destroy any resources that were allocated in the open path.
-	 * This may also be a good place to call usbi_remove_pollfd() to inform
-	 * libusb of any file descriptors associated with this device that should
-	 * no longer be monitored.
+	 * This may also be a good place to call usbi_remove_event_source() to
+	 * inform libusb of any event sources associated with this device that
+	 * should no longer be monitored.
 	 *
 	 * This function is called when the user closes a device handle.
 	 */
@@ -1034,7 +1086,7 @@ struct usbi_os_backend {
 	 * completes, assuming that the device descriptors did not change during
 	 * reset and all previous interface state can be restored.
 	 *
-	 * If something changes, or you cannot easily locate/verify the resetted
+	 * If something changes, or you cannot easily locate/verify the reset
 	 * device, return LIBUSB_ERROR_NOT_FOUND. This prompts the application
 	 * to close the old handle and re-enumerate the device.
 	 *
@@ -1154,21 +1206,22 @@ struct usbi_os_backend {
 	 */
 	void (*clear_transfer_priv)(struct usbi_transfer *itransfer);
 
-	/* Handle any pending events on file descriptors. Optional.
+	/* Handle any pending events on event sources. Optional.
 	 *
-	 * Provide this function when file descriptors directly indicate device
-	 * or transfer activity. If your backend does not have such file descriptors,
+	 * Provide this function when event sources directly indicate device
+	 * or transfer activity. If your backend does not have such event sources,
 	 * implement the handle_transfer_completion function below.
 	 *
 	 * This involves monitoring any active transfers and processing their
 	 * completion or cancellation.
 	 *
-	 * The function is passed an array of pollfd structures (size nfds)
-	 * as a result of the poll() system call. The num_ready parameter
-	 * indicates the number of file descriptors that have reported events
-	 * (i.e. the poll() return value). This should be enough information
-	 * for you to determine which actions need to be taken on the currently
-	 * active transfers.
+	 * The function is passed a pointer that represents platform-specific
+	 * data for monitoring event sources (size count). This data is to be
+	 * (re)allocated as necessary when event sources are modified.
+	 * The num_ready parameter indicates the number of event sources that
+	 * have reported events. This should be enough information for you to
+	 * determine which actions need to be taken on the currently active
+	 * transfers.
 	 *
 	 * For any cancelled transfers, call usbi_handle_transfer_cancellation().
 	 * For completed transfers, call usbi_handle_transfer_completion().
@@ -1187,13 +1240,13 @@ struct usbi_os_backend {
 	 * Return 0 on success, or a LIBUSB_ERROR code on failure.
 	 */
 	int (*handle_events)(struct libusb_context *ctx,
-		struct pollfd *fds, usbi_nfds_t nfds, int num_ready);
+		void *event_data, unsigned int count, unsigned int num_ready);
 
 	/* Handle transfer completion. Optional.
 	 *
-	 * Provide this function when there are no file descriptors available
-	 * that directly indicate device or transfer activity. If your backend does
-	 * have such file descriptors, implement the handle_events function above.
+	 * Provide this function when there are no event sources available that
+	 * directly indicate device or transfer activity. If your backend does
+	 * have such event sources, implement the handle_events function above.
 	 *
 	 * Your backend must tell the library when a transfer has completed by
 	 * calling usbi_signal_transfer_completion(). You should store any private
@@ -1241,8 +1294,32 @@ struct usbi_os_backend {
 
 extern const struct usbi_os_backend usbi_backend;
 
-extern struct list_head active_contexts_list;
-extern usbi_mutex_static_t active_contexts_lock;
+#define for_each_context(c) \
+	for_each_helper(c, &active_contexts_list, struct libusb_context)
+
+#define for_each_device(ctx, d) \
+	for_each_helper(d, &(ctx)->usb_devs, struct libusb_device)
+
+#define for_each_device_safe(ctx, d, n) \
+	for_each_safe_helper(d, n, &(ctx)->usb_devs, struct libusb_device)
+
+#define for_each_open_device(ctx, h) \
+	for_each_helper(h, &(ctx)->open_devs, struct libusb_device_handle)
+
+#define for_each_transfer(ctx, t) \
+	for_each_helper(t, &(ctx)->flying_transfers, struct usbi_transfer)
+
+#define for_each_transfer_safe(ctx, t, n) \
+	for_each_safe_helper(t, n, &(ctx)->flying_transfers, struct usbi_transfer)
+
+#define for_each_event_source(ctx, e) \
+	for_each_helper(e, &(ctx)->event_sources, struct usbi_event_source)
+
+#define for_each_removed_event_source(ctx, e) \
+	for_each_helper(e, &(ctx)->removed_event_sources, struct usbi_event_source)
+
+#define for_each_removed_event_source_safe(ctx, e, n) \
+	for_each_safe_helper(e, n, &(ctx)->removed_event_sources, struct usbi_event_source)
 
 #ifdef __cplusplus
 }

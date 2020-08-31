@@ -337,7 +337,7 @@ static void darwin_devices_attached (void *ptr, io_iterator_t add_devices) {
     }
 
     /* add this device to each active context's device list */
-    list_for_each_entry(ctx, &active_contexts_list, list, struct libusb_context) {
+    for_each_context(ctx) {
       process_new_device (ctx, cached_device, old_session_id);
     }
 
@@ -381,7 +381,7 @@ static void darwin_devices_detached (void *ptr, io_iterator_t rem_devices) {
         if (old_device->in_reenumerate) {
           /* device is re-enumerating. do not dereference the device at this time. libusb_reset_device()
            * will deref if needed. */
-          usbi_dbg ("detected device detatched due to re-enumeration");
+          usbi_dbg ("detected device detached due to re-enumeration");
 
           /* the device object is no longer usable so go ahead and release it */
           if (old_device->device) {
@@ -403,7 +403,7 @@ static void darwin_devices_detached (void *ptr, io_iterator_t rem_devices) {
       continue;
     }
 
-    list_for_each_entry(ctx, &active_contexts_list, list, struct libusb_context) {
+    for_each_context(ctx) {
       usbi_dbg ("notifying context %p of device disconnect", ctx);
 
       dev = usbi_get_device_by_session_id(ctx, (unsigned long) session);
@@ -2215,7 +2215,7 @@ static int darwin_alloc_streams (struct libusb_device_handle *dev_handle, uint32
   uint8_t pipeRef;
   int rc, i;
 
-  /* find the mimimum number of supported streams on the endpoint list */
+  /* find the minimum number of supported streams on the endpoint list */
   for (i = 0 ; i < num_endpoints ; ++i) {
     if (0 != (rc = ep_to_pipeRef (dev_handle, endpoints[i], &pipeRef, NULL, &cInterface))) {
       return rc;

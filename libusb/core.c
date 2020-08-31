@@ -53,7 +53,7 @@ struct list_head active_contexts_list;
  * \section intro Introduction
  *
  * libusb is an open source library that allows you to communicate with USB
- * devices from userspace. For more info, see the
+ * devices from user space. For more info, see the
  * <a href="http://libusb.info">libusb homepage</a>.
  *
  * This documentation is aimed at application developers wishing to
@@ -157,6 +157,36 @@ struct list_head active_contexts_list;
 /**
  * \page libusb_caveats Caveats
  *
+ * \section threadsafety Thread safety
+ *
+ * libusb is designed to be completely thread-safe, but as with any API it
+ * cannot prevent a user from sabotaging themselves, either intentionally or
+ * otherwise.
+ *
+ * Observe the following general guidelines:
+ *
+ * - Calls to functions that release a resource (e.g. libusb_close(),
+ *   libusb_free_config_descriptor()) should not be called concurrently on
+ *   the same resource. This is no different than concurrently calling free()
+ *   on the same allocated pointer.
+ * - Each individual \ref libusb_transfer should be prepared by a single
+ *   thread. In other words, no two threads should ever be concurrently
+ *   filling out the fields of a \ref libusb_transfer. You can liken this to
+ *   calling sprintf() with the same destination buffer from multiple threads.
+ *   The results will likely not be what you want unless the input parameters
+ *   are all the same, but its best to avoid this situation entirely.
+ * - Both the \ref libusb_transfer structure and its associated data buffer
+ *   should not be accessed between the time the transfer is submitted and the
+ *   time the completion callback is invoked. You can think of "ownership" of
+ *   these things as being transferred to libusb while the transfer is active.
+ * - The various "setter" functions (e.g. libusb_set_log_cb(),
+ *   libusb_set_pollfd_notifiers()) should not be called concurrently on the
+ *   resource. Though doing so will not lead to any undefined behavior, it
+ *   will likely produce results that the application does not expect.
+ *
+ * Rules for multiple threads and asynchronous I/O are detailed
+ * \ref libusb_mtasync "here".
+ *
  * \section fork Fork considerations
  *
  * libusb is <em>not</em> designed to work across fork() calls. Depending on
@@ -183,12 +213,12 @@ struct list_head active_contexts_list;
  * you when this has happened, so if someone else resets your device it will
  * not be clear to your own program why the device state has changed.
  *
- * Ultimately, this is a limitation of writing drivers in userspace.
+ * Ultimately, this is a limitation of writing drivers in user space.
  * Separation from the USB stack in the underlying kernel makes it difficult
  * for the operating system to deliver such notifications to your program.
  * The Linux kernel USB stack allows such reset notifications to be delivered
  * to in-kernel USB drivers, but it is not clear how such notifications could
- * be delivered to second-class drivers that live in userspace.
+ * be delivered to second-class drivers that live in user space.
  *
  * \section blockonly Blocking-only functionality
  *
@@ -766,11 +796,12 @@ struct libusb_device *usbi_get_device_by_session_id(struct libusb_context *ctx,
 	struct libusb_device *ret = NULL;
 
 	usbi_mutex_lock(&ctx->usb_devs_lock);
-	list_for_each_entry(dev, &ctx->usb_devs, list, struct libusb_device)
+	for_each_device(ctx, dev) {
 		if (dev->session_data == session_id) {
 			ret = libusb_ref_device(dev);
 			break;
 		}
+	}
 	usbi_mutex_unlock(&ctx->usb_devs_lock);
 
 	return ret;
@@ -819,7 +850,7 @@ ssize_t API_EXPORTED libusb_get_device_list(libusb_context *ctx,
 			usbi_backend.hotplug_poll();
 
 		usbi_mutex_lock(&ctx->usb_devs_lock);
-		list_for_each_entry(dev, &ctx->usb_devs, list, struct libusb_device) {
+		for_each_device(ctx, dev) {
 			discdevs = discovered_devs_append(discdevs, dev);
 
 			if (!discdevs) {
@@ -1187,44 +1218,6 @@ void API_EXPORTED libusb_unref_device(libusb_device *dev)
 	}
 }
 
-/*
- * Signal the event pipe so that the event handling thread will be
- * interrupted to process an internal event.
- */
-int usbi_signal_event(struct libusb_context *ctx)
-{
-	unsigned char dummy = 1;
-	ssize_t r;
-
-	/* write some data on event pipe to interrupt event handlers */
-	r = usbi_write(ctx->event_pipe[1], &dummy, sizeof(dummy));
-	if (r != sizeof(dummy)) {
-		usbi_warn(ctx, "internal signalling write failed");
-		return LIBUSB_ERROR_IO;
-	}
-
-	return 0;
-}
-
-/*
- * Clear the event pipe so that the event handling will no longer be
- * interrupted.
- */
-int usbi_clear_event(struct libusb_context *ctx)
-{
-	unsigned char dummy;
-	ssize_t r;
-
-	/* read some data on event pipe to clear it */
-	r = usbi_read(ctx->event_pipe[0], &dummy, sizeof(dummy));
-	if (r != sizeof(dummy)) {
-		usbi_warn(ctx, "internal signalling read failed");
-		return LIBUSB_ERROR_IO;
-	}
-
-	return 0;
-}
-
 /** \ingroup libusb_dev
  * Wrap a platform-specific system device handle and obtain a libusb device
  * handle for the underlying device. The handle allows you to use libusb to
@@ -1416,7 +1409,7 @@ static void do_close(struct libusb_context *ctx,
 	usbi_mutex_lock(&ctx->flying_transfers_lock);
 
 	/* safe iteration because transfers may be being deleted */
-	list_for_each_entry_safe(itransfer, tmp, &ctx->flying_transfers, list, struct usbi_transfer) {
+	for_each_transfer_safe(ctx, itransfer, tmp) {
 		struct libusb_transfer *transfer =
 			USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
 
@@ -1474,8 +1467,8 @@ static void do_close(struct libusb_context *ctx,
 void API_EXPORTED libusb_close(libusb_device_handle *dev_handle)
 {
 	struct libusb_context *ctx;
+	unsigned int event_flags;
 	int handling_events;
-	int pending_events;
 
 	if (!dev_handle)
 		return;
@@ -1496,10 +1489,11 @@ void API_EXPORTED libusb_close(libusb_device_handle *dev_handle)
 		/* Record that we are closing a device.
 		 * Only signal an event if there are no prior pending events. */
 		usbi_mutex_lock(&ctx->event_data_lock);
-		pending_events = usbi_pending_events(ctx);
-		ctx->device_close++;
-		if (!pending_events)
-			usbi_signal_event(ctx);
+		event_flags = ctx->event_flags;
+		if (!ctx->device_close++)
+			ctx->event_flags |= USBI_EVENT_DEVICE_CLOSE;
+		if (!event_flags)
+			usbi_signal_event(&ctx->event);
 		usbi_mutex_unlock(&ctx->event_data_lock);
 
 		/* take event handling lock */
@@ -1513,10 +1507,10 @@ void API_EXPORTED libusb_close(libusb_device_handle *dev_handle)
 		/* We're done with closing this device.
 		 * Clear the event pipe if there are no further pending events. */
 		usbi_mutex_lock(&ctx->event_data_lock);
-		ctx->device_close--;
-		pending_events = usbi_pending_events(ctx);
-		if (!pending_events)
-			usbi_clear_event(ctx);
+		if (!--ctx->device_close)
+			ctx->event_flags &= ~USBI_EVENT_DEVICE_CLOSE;
+		if (!ctx->event_flags)
+			usbi_clear_event(&ctx->event);
 		usbi_mutex_unlock(&ctx->event_data_lock);
 
 		/* Release event handling lock and wake up event waiters */
@@ -1603,6 +1597,11 @@ int API_EXPORTED libusb_get_configuration(libusb_device_handle *dev_handle,
  * causing most USB-related device state to be reset (altsetting reset to zero,
  * endpoint halts cleared, toggles reset).
  *
+ * Not all backends support setting the configuration from user space, which
+ * will be indicated by the return code LIBUSB_ERROR_NOT_SUPPORTED. As this
+ * suggests that the platform is handling the device configuration itself,
+ * this error should generally be safe to ignore.
+ *
  * You cannot change/reset configuration if your application has claimed
  * interfaces. It is advised to set the desired configuration before claiming
  * interfaces.
@@ -1632,6 +1631,8 @@ int API_EXPORTED libusb_get_configuration(libusb_device_handle *dev_handle,
  * \returns 0 on success
  * \returns LIBUSB_ERROR_NOT_FOUND if the requested configuration does not exist
  * \returns LIBUSB_ERROR_BUSY if interfaces are currently claimed
+ * \returns LIBUSB_ERROR_NOT_SUPPORTED if setting or changing the configuration
+ * is not supported by the backend
  * \returns LIBUSB_ERROR_NO_DEVICE if the device has been disconnected
  * \returns another LIBUSB_ERROR code on other failure
  * \see libusb_set_auto_detach_kernel_driver()
@@ -1926,7 +1927,7 @@ int API_EXPORTED libusb_free_streams(libusb_device_handle *dev_handle,
  * the same cache lines) when a transfer is in progress, although it is legal
  * to have several transfers going on within the same memory block.
  *
- * Will return NULL on failure. Many systems do not support such zerocopy
+ * Will return NULL on failure. Many systems do not support such zero-copy
  * and will always return NULL. Memory allocated with this function must be
  * freed with \ref libusb_dev_mem_free. Specifically, this means that the
  * flag \ref LIBUSB_TRANSFER_FREE_BUFFER cannot be used to free memory allocated
@@ -2352,7 +2353,7 @@ err_free_ctx:
 	usbi_mutex_static_unlock(&active_contexts_lock);
 
 	usbi_mutex_lock(&ctx->usb_devs_lock);
-	list_for_each_entry_safe(dev, next, &ctx->usb_devs, list, struct libusb_device) {
+	for_each_device_safe(ctx, dev, next) {
 		list_del(&dev->list);
 		libusb_unref_device(dev);
 	}
@@ -2432,7 +2433,7 @@ void API_EXPORTED libusb_exit(libusb_context *ctx)
 			libusb_handle_events_timeout(ctx, &tv);
 
 		usbi_mutex_lock(&ctx->usb_devs_lock);
-		list_for_each_entry_safe(dev, next, &ctx->usb_devs, list, struct libusb_device) {
+		for_each_device_safe(ctx, dev, next) {
 			list_del(&dev->list);
 			libusb_unref_device(dev);
 		}

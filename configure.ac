@@ -75,14 +75,12 @@ case $host in
 *-darwin*)
 	AC_MSG_RESULT([Darwin/Mac OS X])
 	backend=darwin
-	events=posix
-	threads=posix
+	platform=posix
 	;;
 *-haiku*)
 	AC_MSG_RESULT([Haiku])
 	backend=haiku
-	events=posix
-	threads=posix
+	platform=posix
 	;;
 *-linux* | *-uclinux*)
 	dnl on Android Linux, some functions are in different places
@@ -96,63 +94,49 @@ case $host in
 		;;
 	esac
 	backend=linux
-	events=posix
-	threads=posix
+	platform=posix
 	;;
 *-netbsd*)
 	AC_MSG_RESULT([NetBSD])
 	backend=netbsd
-	events=posix
-	threads=posix
+	platform=posix
 	;;
 *-openbsd*)
 	AC_MSG_RESULT([OpenBSD])
 	backend=openbsd
-	events=posix
-	threads=posix
+	platform=posix
 	;;
 *-solaris*)
 	AC_MSG_RESULT([SunOS])
 	backend=sunos
-	events=posix
-	threads=posix
+	platform=posix
 	;;
 *-cygwin*)
 	AC_MSG_RESULT([Windows (using Cygwin)])
 	backend=windows
-	events=windows
-	threads=posix
+	platform=windows
+	EXTRA_CFLAGS="-mwin32"
 	;;
 *-mingw* | *msys*)
 	AC_MSG_RESULT([Windows])
 	backend=windows
-	events=windows
-	threads=windows
+	platform=windows
 	test "x$enable_shared" = xyes && create_import_lib=yes
-	EXTRA_CFLAGS="-fno-omit-frame-pointer"
+	EXTRA_CFLAGS="-mwin32 -fno-omit-frame-pointer"
 	;;
 *)
 	AC_MSG_RESULT([Null])
 	AC_MSG_WARN([The host being compiled for is not supported.])
 	AC_MSG_WARN([The library may compile but will not function in any useful manner.])
-	backend="null"
-	events=posix
-	threads="posix"
+	backend=null
+	platform=posix
 	;;
 esac
 
-if test "x$events" = xposix; then
-	AC_DEFINE([EVENTS_POSIX], [1], [Define to 1 if using the POSIX events abstraction.])
+if test "x$platform" = xposix; then
+	AC_DEFINE([PLATFORM_POSIX], [1], [Define to 1 if compiling for a POSIX platform.])
 	AC_CHECK_TYPES([nfds_t], [], [], [[#include <poll.h>]])
 	AC_CHECK_FUNCS([pipe2])
-elif test "x$events" = xwindows; then
-	AC_DEFINE([EVENTS_WINDOWS], [1], [Define to 1 if using the Windows events abstraction.])
-else
-	AC_MSG_ERROR([Unknown events abstraction])
-fi
-
-if test "x$threads" = xposix; then
-	AC_DEFINE([THREADS_POSIX], [1], [Define to 1 if using POSIX threads.])
 	dnl Some compilers do not support the '-pthread' option so check for it here
 	saved_CFLAGS="${CFLAGS}"
 	CFLAGS="-Wall -Werror -pthread"
@@ -167,10 +151,10 @@ if test "x$threads" = xposix; then
 	AC_SEARCH_LIBS([pthread_create], [pthread],
 		[test "x$ac_cv_search_pthread_create" != "xnone required" && AC_SUBST(THREAD_LIBS, [-lpthread])],
 		[], [])
-elif test "x$threads" = xwindows; then
-	AC_DEFINE([THREADS_WINDOWS], [1], [Define to 1 if using Windows threads.])
+elif test "x$platform" = xwindows; then
+	AC_DEFINE([PLATFORM_WINDOWS], [1], [Define to 1 if compiling for a Windows platform.])
 else
-	AC_MSG_ERROR([Unknown threads implementation])
+	AC_MSG_ERROR([Unknown platform])
 fi
 
 case $backend in
@@ -203,9 +187,6 @@ sunos)
 windows)
 	AC_CHECK_TYPES([struct timespec], [], [], [[#include <time.h>]])
 	AC_DEFINE([_WIN32_WINNT], [_WIN32_WINNT_VISTA], [Define to the oldest supported Windows version.])
-	dnl Cygwin and MSYS compilers do not define _WIN32 as MinGW and MSVC do
-	dnl simplify checks for Windows compilation by ensuring it is always defined
-	EXTRA_CPPFLAGS="-D_WIN32"
 	LT_LDFLAGS="${LT_LDFLAGS} -avoid-version -Wl,--add-stdcall-alias"
 	;;
 *)
@@ -216,13 +197,19 @@ esac
 dnl headers not available on all platforms but required on others
 AC_CHECK_HEADERS([sys/time.h])
 
-dnl the clock_gettime() function needs certain clock IDs defined
-AC_CHECK_FUNCS([clock_gettime], [have_clock_gettime=yes], [have_clock_gettime=])
-if test "x$have_clock_gettime" = xyes; then
-	AC_CHECK_DECL([CLOCK_REALTIME], [], [AC_MSG_ERROR([C library headers missing definition for CLOCK_REALTIME])], [[#include <time.h>]])
-	AC_CHECK_DECL([CLOCK_MONOTONIC], [], [AC_MSG_ERROR([C library headers missing definition for CLOCK_MONOTONIC])], [[#include <time.h>]])
-elif test "x$backend" != xdarwin && test "x$backend" != xwindows; then
-	AC_MSG_ERROR([clock_gettime() is required on this platform])
+if test "x$platform" = xposix; then
+	dnl the clock_gettime() function needs certain clock IDs defined
+	AC_CHECK_FUNCS([clock_gettime], [have_clock_gettime=yes], [have_clock_gettime=])
+	if test "x$have_clock_gettime" = xyes; then
+		AC_CHECK_DECL([CLOCK_MONOTONIC], [], [AC_MSG_ERROR([C library headers missing definition for CLOCK_MONOTONIC])], [[#include <time.h>]])
+		dnl use the monotonic clock for condition variable timed waits if possible
+		AC_CHECK_FUNCS([pthread_condattr_setclock], [need_clock_realtime=], [need_clock_realtime=yes])
+		if test "x$need_clock_realtime" = xyes; then
+			AC_CHECK_DECL([CLOCK_REALTIME], [], [AC_MSG_ERROR([C library headers missing definition for CLOCK_REALTIME])], [[#include <time.h>]])
+		fi
+	elif test "x$backend" != xdarwin; then
+		AC_MSG_ERROR([clock_gettime() is required on this platform])
+	fi
 fi
 
 dnl eventfd support
@@ -352,8 +339,6 @@ AC_ARG_ENABLE([tests-build],
 AM_CONDITIONAL([BUILD_EXAMPLES], [test "x$build_examples" != xno])
 AM_CONDITIONAL([BUILD_TESTS], [test "x$build_tests" != xno])
 AM_CONDITIONAL([CREATE_IMPORT_LIB], [test "x$create_import_lib" = xyes])
-AM_CONDITIONAL([EVENTS_POSIX], [test "x$events" = xposix])
-AM_CONDITIONAL([EVENTS_WINDOWS], [test "x$events" = xwindows])
 AM_CONDITIONAL([HAVE_SIGACTION], [test "x$have_sigaction" = xyes])
 AM_CONDITIONAL([OS_DARWIN], [test "x$backend" = xdarwin])
 AM_CONDITIONAL([OS_HAIKU], [test "x$backend" = xhaiku])
@@ -363,8 +348,8 @@ AM_CONDITIONAL([OS_NULL], [test "x$backend" = xnull])
 AM_CONDITIONAL([OS_OPENBSD], [test "x$backend" = xopenbsd])
 AM_CONDITIONAL([OS_SUNOS], [test "x$backend" = xsunos])
 AM_CONDITIONAL([OS_WINDOWS], [test "x$backend" = xwindows])
-AM_CONDITIONAL([THREADS_POSIX], [test "x$threads" = xposix])
-AM_CONDITIONAL([THREADS_WINDOWS], [test "x$threads" = xwindows])
+AM_CONDITIONAL([PLATFORM_POSIX], [test "x$platform" = xposix])
+AM_CONDITIONAL([PLATFORM_WINDOWS], [test "x$platform" = xwindows])
 AM_CONDITIONAL([USE_UDEV], [test "x$use_udev" = xyes])
 
 dnl The -Wcast-function-type warning causes a flurry of warnings when compiling

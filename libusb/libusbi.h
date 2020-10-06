@@ -3,7 +3,7 @@
  * Copyright © 2007-2009 Daniel Drake <dsd@gentoo.org>
  * Copyright © 2001 Johannes Erdfelt <johannes@erdfelt.com>
  * Copyright © 2019 Nathan Hjelm <hjelmn@cs.umm.edu>
- * Copyright © 2019 Google LLC. All rights reserved.
+ * Copyright © 2019-2020 Google LLC. All rights reserved.
  * Copyright © 2020 Chris Dickens <christopher.a.dickens@gmail.com>
  *
  * This library is free software; you can redistribute it and/or
@@ -27,6 +27,7 @@
 #include <config.h>
 
 #include <assert.h>
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -41,6 +42,14 @@
  */
 #if !defined(__cplusplus) && !defined(static_assert) && !defined(_MSC_VER)
 #define static_assert(cond, msg) _Static_assert(cond, msg)
+#endif
+
+#ifdef NDEBUG
+#define ASSERT_EQ(expression, value)	(void)expression
+#define ASSERT_NE(expression, value)	(void)expression
+#else
+#define ASSERT_EQ(expression, value)	assert(expression == value)
+#define ASSERT_NE(expression, value)	assert(expression != value)
 #endif
 
 #define container_of(ptr, type, member) \
@@ -74,17 +83,12 @@
 #define PTR_ALIGN(v) \
 	(((v) + (sizeof(void *) - 1)) & ~(sizeof(void *) - 1))
 
-/* Internal abstraction for event handling */
-#if defined(EVENTS_POSIX)
+/* Internal abstractions for event handling and thread synchronization */
+#if defined(PLATFORM_POSIX)
 #include "os/events_posix.h"
-#elif defined(EVENTS_WINDOWS)
-#include "os/events_windows.h"
-#endif
-
-/* Internal abstraction for thread synchronization */
-#if defined(THREADS_POSIX)
 #include "os/threads_posix.h"
-#elif defined(THREADS_WINDOWS)
+#elif defined(PLATFORM_WINDOWS)
+#include "os/events_windows.h"
 #include "os/threads_windows.h"
 #endif
 
@@ -203,8 +207,10 @@ static inline void list_del(struct list_head *entry)
 
 static inline void list_cut(struct list_head *list, struct list_head *head)
 {
-	if (list_empty(head))
+	if (list_empty(head)) {
+		list_init(list);
 		return;
+	}
 
 	list->next = head->next;
 	list->next->prev = list;
@@ -212,6 +218,13 @@ static inline void list_cut(struct list_head *list, struct list_head *head)
 	list->prev->next = list;
 
 	list_init(head);
+}
+
+static inline void list_splice_front(struct list_head *list, struct list_head *head)
+{
+	list->next->prev = head;
+	list->prev->next = head->next;
+	head->next = list->next;
 }
 
 static inline void *usbi_reallocf(void *ptr, size_t size)
@@ -222,6 +235,18 @@ static inline void *usbi_reallocf(void *ptr, size_t size)
 		free(ptr);
 	return ret;
 }
+
+#if !defined(USEC_PER_SEC)
+#define USEC_PER_SEC	1000000L
+#endif
+
+#if !defined(NSEC_PER_SEC)
+#define NSEC_PER_SEC	1000000000L
+#endif
+
+#define TIMEVAL_IS_VALID(tv)						\
+	((tv)->tv_sec >= 0 &&						\
+	 (tv)->tv_usec >= 0 && (tv)->tv_usec < USEC_PER_SEC)
 
 #define TIMESPEC_IS_SET(ts)	((ts)->tv_sec || (ts)->tv_nsec)
 #define TIMESPEC_CLEAR(ts)	(ts)->tv_sec = (ts)->tv_nsec = 0
@@ -235,11 +260,11 @@ static inline void *usbi_reallocf(void *ptr, size_t size)
 		(result)->tv_nsec = (a)->tv_nsec - (b)->tv_nsec;	\
 		if ((result)->tv_nsec < 0L) {				\
 			--(result)->tv_sec;				\
-			(result)->tv_nsec += 1000000000L;		\
+			(result)->tv_nsec += NSEC_PER_SEC;		\
 		}							\
 	} while (0)
 
-#if defined(_WIN32)
+#if defined(PLATFORM_WINDOWS)
 #define TIMEVAL_TV_SEC_TYPE	long
 #else
 #define TIMEVAL_TV_SEC_TYPE	time_t
@@ -261,15 +286,12 @@ static inline void *usbi_reallocf(void *ptr, size_t size)
 #define snprintf usbi_snprintf
 #define vsnprintf usbi_vsnprintf
 int usbi_snprintf(char *dst, size_t size, const char *format, ...);
-int usbi_vsnprintf(char *dst, size_t size, const char *format, va_list ap);
+int usbi_vsnprintf(char *dst, size_t size, const char *format, va_list args);
 #define LIBUSB_PRINTF_WIN32
 #endif /* defined(_MSC_VER) && (_MSC_VER < 1900) */
 
 void usbi_log(struct libusb_context *ctx, enum libusb_log_level level,
 	const char *function, const char *format, ...) USBI_PRINTFLIKE(4, 5);
-
-void usbi_log_v(struct libusb_context *ctx, enum libusb_log_level level,
-	const char *function, const char *format, va_list args) USBI_PRINTFLIKE(4, 0);
 
 #define _usbi_log(ctx, level, ...) usbi_log(ctx, level, __func__, __VA_ARGS__)
 
@@ -336,7 +358,7 @@ struct libusb_context {
 	 * take this lock first */
 	usbi_mutex_t flying_transfers_lock;
 
-#if !defined(_WIN32) && !defined(__CYGWIN__)
+#if !defined(PLATFORM_WINDOWS)
 	/* user callbacks for pollfd changes */
 	libusb_pollfd_added_cb fd_added_cb;
 	libusb_pollfd_removed_cb fd_removed_cb;
@@ -479,22 +501,26 @@ static inline void usbi_localize_device_descriptor(struct libusb_device_descript
 }
 
 #ifdef HAVE_CLOCK_GETTIME
-#define USBI_CLOCK_REALTIME	CLOCK_REALTIME
-#define USBI_CLOCK_MONOTONIC	CLOCK_MONOTONIC
-#define usbi_clock_gettime	clock_gettime
+static inline void usbi_get_monotonic_time(struct timespec *tp)
+{
+	ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, tp), 0);
+}
+static inline void usbi_get_real_time(struct timespec *tp)
+{
+	ASSERT_EQ(clock_gettime(CLOCK_REALTIME, tp), 0);
+}
 #else
 /* If the platform doesn't provide the clock_gettime() function, the backend
- * must provide its own implementation.  Two clocks must be supported by the
- * backend: USBI_CLOCK_REALTIME, and USBI_CLOCK_MONOTONIC.
+ * must provide its own clock implementations.  Two clock functions are
+ * required:
  *
- * Description of clocks:
- *   USBI_CLOCK_REALTIME:  clock returns time since system epoch.
- *   USBI_CLOCK_MONOTONIC: clock returns time since unspecified start time
- *			   (usually boot).
+ *   usbi_get_monotonic_time(): returns the time since an unspecified starting
+ *                              point (usually boot) that is monotonically
+ *                              increasing.
+ *   usbi_get_real_time(): returns the time since system epoch.
  */
-#define USBI_CLOCK_REALTIME	0
-#define USBI_CLOCK_MONOTONIC	1
-int usbi_clock_gettime(int clk_id, struct timespec *tp);
+void usbi_get_monotonic_time(struct timespec *tp);
+void usbi_get_real_time(struct timespec *tp);
 #endif
 
 /* in-memory transfer layout:
@@ -615,7 +641,7 @@ struct usbi_interface_descriptor {
 struct usbi_string_descriptor {
 	uint8_t  bLength;
 	uint8_t  bDescriptorType;
-	uint16_t wData[];
+	uint16_t wData[ZERO_SIZED_ARRAY];
 } LIBUSB_PACKED;
 
 struct usbi_bos_descriptor {
@@ -628,6 +654,24 @@ struct usbi_bos_descriptor {
 #ifdef _MSC_VER
 #pragma pack(pop)
 #endif
+
+union usbi_config_desc_buf {
+        struct usbi_configuration_descriptor desc;
+        uint8_t buf[LIBUSB_DT_CONFIG_SIZE];
+        uint16_t align;         /* Force 2-byte alignment */
+};
+
+union usbi_string_desc_buf {
+        struct usbi_string_descriptor desc;
+        uint8_t buf[255];       /* Some devices choke on size > 255 */
+        uint16_t align;         /* Force 2-byte alignment */
+};
+
+union usbi_bos_desc_buf {
+        struct usbi_bos_descriptor desc;
+        uint8_t buf[LIBUSB_DT_BOS_SIZE];
+        uint16_t align;         /* Force 2-byte alignment */
+};
 
 /* shared data and functions */
 
@@ -1306,11 +1350,17 @@ extern const struct usbi_os_backend usbi_backend;
 #define for_each_open_device(ctx, h) \
 	for_each_helper(h, &(ctx)->open_devs, struct libusb_device_handle)
 
+#define __for_each_transfer(list, t) \
+	for_each_helper(t, (list), struct usbi_transfer)
+
 #define for_each_transfer(ctx, t) \
-	for_each_helper(t, &(ctx)->flying_transfers, struct usbi_transfer)
+	__for_each_transfer(&(ctx)->flying_transfers, t)
+
+#define __for_each_transfer_safe(list, t, n) \
+	for_each_safe_helper(t, n, (list), struct usbi_transfer)
 
 #define for_each_transfer_safe(ctx, t, n) \
-	for_each_safe_helper(t, n, &(ctx)->flying_transfers, struct usbi_transfer)
+	__for_each_transfer_safe(&(ctx)->flying_transfers, t, n)
 
 #define for_each_event_source(ctx, e) \
 	for_each_helper(e, &(ctx)->event_sources, struct usbi_event_source)
